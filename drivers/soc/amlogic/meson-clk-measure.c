@@ -28,6 +28,8 @@ static DEFINE_MUTEX(measure_lock);
 #define DIV_STEP		32
 #define DIV_MAX			640
 
+#define CLK_MSR_MAX		256
+
 struct meson_msr_id {
 	struct meson_msr *priv;
 	unsigned int id;
@@ -42,6 +44,7 @@ struct msr_reg_offset {
 };
 
 struct meson_msr_data {
+	struct meson_msr_data *parent;
 	struct meson_msr_id *msr_table;
 	unsigned int msr_count;
 	const struct msr_reg_offset *reg;
@@ -49,7 +52,9 @@ struct meson_msr_data {
 
 struct meson_msr {
 	struct regmap *regmap;
-	struct meson_msr_data data;
+	struct msr_reg_offset *reg;
+	struct meson_msr_id *msr_table;
+	unsigned int msr_count;
 };
 
 #define CLK_MSR_ID(__id, __name) \
@@ -1627,7 +1632,7 @@ static int meson_measure_id(struct meson_msr_id *clk_msr_id,
 			    unsigned int duration)
 {
 	struct meson_msr *priv = clk_msr_id->priv;
-	const struct msr_reg_offset *reg = priv->data.reg;
+	const struct msr_reg_offset *reg = priv->reg;
 	unsigned int val;
 	int ret;
 
@@ -1709,7 +1714,7 @@ DEFINE_SHOW_ATTRIBUTE(clk_msr);
 static int clk_msr_summary_show(struct seq_file *s, void *data)
 {
 	struct meson_msr_id *msr_table = s->private;
-	unsigned int msr_count = msr_table->priv->data.msr_count;
+	unsigned int msr_count = msr_table->priv->msr_count;
 	unsigned int precision = 0;
 	int val, i;
 
@@ -1732,6 +1737,76 @@ static int clk_msr_summary_show(struct seq_file *s, void *data)
 }
 DEFINE_SHOW_ATTRIBUTE(clk_msr_summary);
 
+static const char *meson_msr_get_name_by_id(const struct meson_msr_data *msr_data,
+					    unsigned int msr_id)
+{
+	int i;
+	struct meson_msr_id *msr_table = msr_data->msr_table;
+
+	if (msr_table) {
+		for (i = 0; i < msr_data->msr_count; i++) {
+			if (msr_id == msr_table[i].id)
+				return msr_table[i].name;
+		}
+	}
+
+	if (!msr_data->parent)
+		return NULL;
+
+	return meson_msr_get_name_by_id(msr_data->parent, msr_id);
+}
+
+static int meson_msr_get_table_count(const struct meson_msr_data *msr_data)
+{
+	int i, tab_cnt = 0;
+	const char *msr_name;
+
+	for (i = 0; i < CLK_MSR_MAX; i++) {
+		msr_name = meson_msr_get_name_by_id(msr_data, i);
+		if (msr_name)
+			tab_cnt++;
+	}
+	if (tab_cnt)
+		return tab_cnt;
+
+	return -ENODATA;
+}
+
+static int meson_msr_get_table(const struct meson_msr_data *msr_data,
+			       struct meson_msr_id *out_tab)
+{
+	int i, tab_cnt = 0;
+	const char *msr_name;
+
+	for (i = 0; i < CLK_MSR_MAX; i++) {
+		msr_name = meson_msr_get_name_by_id(msr_data, i);
+		if (msr_name) {
+			out_tab[tab_cnt].id = i;
+			out_tab[tab_cnt].name = msr_name;
+			tab_cnt++;
+		}
+	}
+	if (tab_cnt)
+		return 0;
+
+	return -ENODATA;
+}
+
+static int meson_msr_get_reg(const struct meson_msr_data *msr_data,
+			     struct msr_reg_offset *out_reg)
+{
+	if (msr_data->reg) {
+		memcpy((void *)out_reg, msr_data->reg,
+		       sizeof(struct msr_reg_offset));
+		return 0;
+	}
+
+	if (!msr_data->parent)
+		return -ENODATA;
+
+	return meson_msr_get_reg(msr_data->parent, out_reg);
+}
+
 static struct regmap_config meson_clk_msr_regmap_config = {
 	.reg_bits = 32,
 	.val_bits = 32,
@@ -1745,7 +1820,7 @@ static int meson_msr_probe(struct platform_device *pdev)
 	struct dentry *root, *clks;
 	struct resource *res;
 	void __iomem *base;
-	int i;
+	int i, ret;
 
 	priv = devm_kzalloc(&pdev->dev, sizeof(struct meson_msr),
 			    GFP_KERNEL);
@@ -1758,16 +1833,20 @@ static int meson_msr_probe(struct platform_device *pdev)
 		return -ENODEV;
 	}
 
-	priv->data.msr_table = devm_kcalloc(&pdev->dev,
-					    match_data->msr_count,
-					    sizeof(struct meson_msr_id),
-					    GFP_KERNEL);
-	if (!priv->data.msr_table)
+	ret = meson_msr_get_table_count(match_data);
+	if (ret < 0)
+		return ret;
+
+	priv->msr_count = ret;
+	priv->msr_table = devm_kcalloc(&pdev->dev, priv->msr_count,
+				       sizeof(struct meson_msr_id),
+				       GFP_KERNEL);
+	if (!priv->msr_table)
 		return -ENOMEM;
 
-	memcpy(priv->data.msr_table, match_data->msr_table,
-	       match_data->msr_count * sizeof(struct meson_msr_id));
-	priv->data.msr_count = match_data->msr_count;
+	ret = meson_msr_get_table(match_data, priv->msr_table);
+	if (ret)
+		return ret;
 
 	base = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
 	if (IS_ERR(base))
@@ -1779,28 +1858,29 @@ static int meson_msr_probe(struct platform_device *pdev)
 	if (IS_ERR(priv->regmap))
 		return PTR_ERR(priv->regmap);
 
-	priv->data.reg = devm_kzalloc(&pdev->dev, sizeof(struct msr_reg_offset),
+	priv->reg = devm_kzalloc(&pdev->dev, sizeof(struct msr_reg_offset),
 				      GFP_KERNEL);
-	if (!priv->data.reg)
+	if (!priv->reg)
 		return -ENOMEM;
 
-	memcpy((void *)priv->data.reg, match_data->reg,
-	       sizeof(struct msr_reg_offset));
+	ret = meson_msr_get_reg(match_data, priv->reg);
+	if (ret)
+		return ret;
 
 	root = debugfs_create_dir("meson-clk-msr", NULL);
 	clks = debugfs_create_dir("clks", root);
 
 	debugfs_create_file("measure_summary", 0444, root,
-			    priv->data.msr_table, &clk_msr_summary_fops);
+			    priv->msr_table, &clk_msr_summary_fops);
 
-	for (i = 0 ; i < priv->data.msr_count ; ++i) {
-		if (!priv->data.msr_table[i].name)
+	for (i = 0 ; i < priv->msr_count ; ++i) {
+		if (!priv->msr_table[i].name)
 			continue;
 
-		priv->data.msr_table[i].priv = priv;
+		priv->msr_table[i].priv = priv;
 
-		debugfs_create_file(priv->data.msr_table[i].name, 0444, clks,
-				    &priv->data.msr_table[i], &clk_msr_fops);
+		debugfs_create_file(priv->msr_table[i].name, 0444, clks,
+				    &priv->msr_table[i], &clk_msr_fops);
 	}
 
 	return 0;
